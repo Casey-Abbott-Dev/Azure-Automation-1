@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 env:
-  RESOURCE_GROUP:        rg-automation-audit
+  RESOURCE_GROUP:        rg-d-automate-001
   AUTOMATION_ACCOUNT:    aa-disabled-user-audit
   RUNBOOK_NAME:          Get-DisabledGroupMembers
   RUNBOOK_PATH:          runbook/Get-DisabledGroupMembers.ps1
@@ -24,6 +24,7 @@ jobs:
   deploy:
     name: Import & Publish Runbook
     runs-on: ubuntu-latest
+    environment: dev
 
     steps:
       - name: Checkout repository
