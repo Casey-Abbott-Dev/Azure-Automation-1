@@ -196,7 +196,50 @@ foreach ($roleName in $requiredRoles) {
 
 #endregion
 
-#region STEP 10 — Schedule
+#region STEP 10 — Restrict Mail.Send via Exchange Online Application Access Policy
+
+# Mail.Send as an application permission allows sending as ANY user in the tenant.
+# An Application Access Policy scopes it to the sender mailbox only.
+# This step requires Exchange Online admin rights and a separate module — it outputs
+# the exact commands to run rather than executing them automatically.
+
+$miAppId = (Get-AzADServicePrincipal -ObjectId $principalId).AppId
+
+Write-Host ""
+Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Yellow
+Write-Host "  ACTION REQUIRED — Restrict Mail.Send to the sender mailbox" -ForegroundColor Yellow
+Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Yellow
+Write-Host ""
+Write-Host "  The Mail.Send permission currently allows this app to send as ANY"
+Write-Host "  user in your tenant. Run the following in Exchange Online PowerShell"
+Write-Host "  (requires Exchange Online admin) to lock it to one mailbox:"
+Write-Host ""
+Write-Host "    # 1. Install module if needed"
+Write-Host "    Install-Module ExchangeOnlineManagement -Scope CurrentUser"
+Write-Host ""
+Write-Host "    # 2. Connect"
+Write-Host "    Connect-ExchangeOnline"
+Write-Host ""
+Write-Host "    # 3. Create a distribution group containing only the sender mailbox"
+Write-Host "    New-DistributionGroup -Name 'dl-automation-senders' -Members '<sender-mailbox-upn>'"
+Write-Host ""
+Write-Host "    # 4. Apply the restriction (SAMI App ID: $miAppId)"
+Write-Host "    New-ApplicationAccessPolicy ``"
+Write-Host "        -AppId             '$miAppId' ``"
+Write-Host "        -PolicyScopeGroupId 'dl-automation-senders' ``"
+Write-Host "        -AccessRight        RestrictAccess ``"
+Write-Host "        -Description        'Restrict automation SAMI to sender mailbox only'"
+Write-Host ""
+Write-Host "    # 5. Verify"
+Write-Host "    Test-ApplicationAccessPolicy -AppId '$miAppId' -Identity '<sender-mailbox-upn>'"
+Write-Host "    # Expected: AccessCheckResult : Granted"
+Write-Host ""
+Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Yellow
+Write-Host ""
+
+#endregion
+
+#region STEP 11 — Schedule
 
 Write-Host "Creating weekly schedule (Mondays 07:00 UTC)..." -ForegroundColor Cyan
 

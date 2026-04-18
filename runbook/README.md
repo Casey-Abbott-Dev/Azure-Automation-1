@@ -74,21 +74,47 @@ Set-AzKeyVaultSecret -VaultName 'kv-auto-audit-001' -Name 'recipient-email' -Sec
 
 ### Managed Identity — Key Vault
 
-The Automation Account's Managed Identity needs the **Key Vault Secrets User** role on the Key Vault. This is scoped to the Key Vault resource only (not the whole subscription).
-
-| Role | Scope | Purpose |
+| Role | Scope | Can it be narrowed further? |
 |---|---|---|
-| `Key Vault Secrets User` | Key Vault resource | Read secrets at runtime |
+| `Key Vault Secrets User` | This specific Key Vault only | **Already minimum.** Grants `Get` and `ReadMetadata` on secrets only — cannot create, update, or delete. Scoped to the vault resource, not the subscription. |
 
 ### Managed Identity — Microsoft Graph (Application permissions)
 
-| Permission | Purpose |
-|---|---|
-| `GroupMember.Read.All` | List all members of the target security group |
-| `User.Read.All` | Read the `accountEnabled` property on each user |
-| `Mail.Send` | Send email as the sender mailbox |
+All three permissions are application-level (no signed-in user) and require **admin consent**.
 
-All three require **admin consent** — see root README Step 4.
+| Permission | Why it is required | Can it be narrowed further? |
+|---|---|---|
+| `GroupMember.Read.All` | The runbook calls `GET /groups/{id}/members` to list group members. | **No.** Graph has no per-group application scope. `GroupMember.Read.All` is already narrower than `Group.Read.All` (which also exposes group settings and metadata) and far narrower than `Directory.Read.All`. |
+| `User.Read.All` | The `accountEnabled` property is a user attribute. Graph requires this permission to return it, even when the user is fetched via the group members endpoint. | **No.** The alternatives (`Directory.Read.All`) are all broader. The runbook minimises exposure by using `$select=id,displayName,userPrincipalName,accountEnabled` — only four fields are ever returned. |
+| `Mail.Send` | The runbook calls `POST /users/{sender}/sendMail` to deliver the report. | **Yes — see below.** As an application permission this grants the ability to send as *any* user in the tenant. An Exchange Online Application Access Policy restricts it to the sender mailbox only. |
+
+### Restricting Mail.Send with an Application Access Policy
+
+Without a policy, `Mail.Send` is tenant-wide. Apply the restriction once after deployment:
+
+```powershell
+# Requires Exchange Online admin rights
+Install-Module ExchangeOnlineManagement -Scope CurrentUser
+Connect-ExchangeOnline
+
+# Create a distribution group containing only the sender mailbox
+New-DistributionGroup -Name 'dl-automation-senders' -Members 'alerts@yourdomain.com'
+
+# Lock the SAMI to that group only (use the App ID printed at end of deployment)
+New-ApplicationAccessPolicy `
+    -AppId              'YOUR_SAMI_APP_ID' `
+    -PolicyScopeGroupId 'dl-automation-senders' `
+    -AccessRight        RestrictAccess `
+    -Description        'Restrict automation SAMI to sender mailbox only'
+
+# Verify — should return: AccessCheckResult : Granted
+Test-ApplicationAccessPolicy -AppId 'YOUR_SAMI_APP_ID' -Identity 'alerts@yourdomain.com'
+
+# Verify a mailbox NOT in the group is blocked — should return: AccessCheckResult : Denied
+Test-ApplicationAccessPolicy -AppId 'YOUR_SAMI_APP_ID' -Identity 'other.user@yourdomain.com'
+```
+
+> The deployment script (Step 10) prints the SAMI's AppId and these exact commands for you.
 
 ---
 

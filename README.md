@@ -335,6 +335,18 @@ Set-AzKeyVaultSecret -VaultName 'kv-auto-audit-001' -Name 'recipient-email' -Sec
 
 The runbook always reads the **latest enabled version** of each secret, so changes take effect on the next job run with no redeployment needed.
 
+### Graph API permission scope
+
+The three Graph permissions granted to the Managed Identity are already the minimum possible for this workload. The table below explains why, and what to do about the one permission that can be further restricted after deployment.
+
+| Permission | Granted scope | Can it be narrowed? |
+|---|---|---|
+| `GroupMember.Read.All` | Read membership of any group in the tenant | **No.** Graph has no per-group application scope. This is already narrower than `Group.Read.All` or `Directory.Read.All`. |
+| `User.Read.All` | Read any user's properties | **No.** Needed to return `accountEnabled` via the group members endpoint. The runbook limits exposure with `$select` (only 4 fields returned). |
+| `Mail.Send` | Send email as **any user** in the tenant | **Yes — apply an Exchange Online Application Access Policy** (see `runbook/README.md` for the exact commands). This restricts the app to one mailbox and is the recommended post-deployment hardening step. |
+
+---
+
 ### Who can read/write secrets
 
 | Identity | Role | Granted by |
