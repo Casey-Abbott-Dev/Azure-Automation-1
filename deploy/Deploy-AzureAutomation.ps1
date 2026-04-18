@@ -1,42 +1,55 @@
 <#
     .SYNOPSIS
-        Deploys the disabled-account audit Azure Automation solution.
+        Deploys the disabled-account audit Azure Automation solution with Azure Key Vault.
 
     PREREQUISITES
-        - Az PowerShell module  (Install-Module Az -Scope CurrentUser)
-        - Connected to Azure    (Connect-AzAccount)
-        - A Microsoft 365 mailbox for the sender (the Managed Identity needs Mail.Send
-          on that specific mailbox — see STEP 5 comments)
+        - Az PowerShell module        (Install-Module Az -Scope CurrentUser)
+        - Microsoft.Graph module      (Install-Module Microsoft.Graph -Scope CurrentUser)
+        - Connected to Azure          (Connect-AzAccount)
+        - A Microsoft 365 mailbox for the sender UPN
 
     USAGE
-        Edit the CONFIGURATION block below, then run this script once.
+        Edit the CONFIGURATION block below (non-sensitive values only), then run
+        this script once. Sensitive values are prompted at runtime and never stored
+        in this file or displayed in the console.
 #>
 
-#region --- CONFIGURATION --- edit these values before running ---
+#region --- CONFIGURATION — non-sensitive infrastructure values only ---
 
-$subscriptionId     = 'YOUR_SUBSCRIPTION_ID'
-$resourceGroupName  = 'rg-automation-audit'
-$location           = 'eastus'                        # Azure region
-
+$subscriptionId        = 'YOUR_SUBSCRIPTION_ID'
+$resourceGroupName     = 'rg-automation-audit'
+$location              = 'eastus'
 $automationAccountName = 'aa-disabled-user-audit'
 
-# Entra ID group to audit
-$groupObjectId      = 'YOUR_GROUP_OBJECT_ID'
+# Key Vault name — must be globally unique, 3-24 chars, alphanumeric and hyphens only
+$keyVaultName          = 'kv-auto-audit-001'
 
-# M365 mailbox that will send the report (must have an Exchange Online license)
-$senderMailbox      = 'automation-alerts@yourdomain.com'
-
-# Where the report gets delivered
-$recipientEmail     = 'caseyabbott.dev@outlook.com'
+# Object ID of the GitHub Actions service principal (from the CI/CD setup)
+# Set to $null to skip granting GitHub Actions access to Key Vault
+$githubSpObjectId      = $null
 
 # Schedule — runs weekly on Monday at 07:00 UTC
-$scheduleStartTime  = (Get-Date).Date.AddDays((1 - (Get-Date).DayOfWeek.value__ + 7) % 7 + 7).AddHours(7)
+$scheduleStartTime     = (Get-Date).Date.AddDays((1 - (Get-Date).DayOfWeek.value__ + 7) % 7 + 7).AddHours(7)
 
-$runbookPath        = Join-Path $PSScriptRoot '..\runbook\Get-DisabledGroupMembers.ps1'
+$runbookPath           = Join-Path $PSScriptRoot '..\runbook\Get-DisabledGroupMembers.ps1'
 
 #endregion
 
 Set-AzContext -SubscriptionId $subscriptionId | Out-Null
+$tenantId = (Get-AzContext).Tenant.Id
+
+#region --- SENSITIVE INPUTS — prompted once, stored only in Key Vault ---
+
+Write-Host "`nEnter sensitive values. Input is masked and never written to disk." -ForegroundColor Yellow
+$secretInputs = [ordered]@{
+    'group-object-id' = Read-Host -AsSecureString "  Entra ID Group Object ID  "
+    'sender-mailbox'  = Read-Host -AsSecureString "  Sender mailbox UPN        "
+    'recipient-email' = Read-Host -AsSecureString "  Recipient email address   "
+    'tenant-id'       = ConvertTo-SecureString $tenantId -AsPlainText -Force
+}
+Write-Host ""
+
+#endregion
 
 #region STEP 1 — Resource Group
 
@@ -52,71 +65,114 @@ $aa = New-AzAutomationAccount `
     -ResourceGroupName $resourceGroupName `
     -Name $automationAccountName `
     -Location $location `
-    -AssignSystemIdentity   # enables System-assigned Managed Identity
+    -AssignSystemIdentity
 
 $principalId = $aa.Identity.PrincipalId
 Write-Host "  Managed Identity principal ID: $principalId"
 
 #endregion
 
-#region STEP 3 — Automation Variables
+#region STEP 3 — Key Vault
 
-Write-Host "Setting Automation Variables..." -ForegroundColor Cyan
+Write-Host "Creating Key Vault '$keyVaultName'..." -ForegroundColor Cyan
 
-$vars = @{
-    GroupObjectId   = $groupObjectId
-    SenderMailbox   = $senderMailbox
-    RecipientEmail  = $recipientEmail
-    TenantId        = (Get-AzContext).Tenant.Id
-}
+$kv = New-AzKeyVault `
+    -Name              $keyVaultName `
+    -ResourceGroupName $resourceGroupName `
+    -Location          $location `
+    -EnableRbacAuthorization $true   # use Azure RBAC instead of legacy access policies
 
-foreach ($kv in $vars.GetEnumerator()) {
-    New-AzAutomationVariable `
-        -ResourceGroupName $resourceGroupName `
-        -AutomationAccountName $automationAccountName `
-        -Name $kv.Key `
-        -Value $kv.Value `
-        -Encrypted $false | Out-Null
+Write-Host "  Key Vault URI: $($kv.VaultUri)"
+
+#endregion
+
+#region STEP 4 — Store Secrets in Key Vault
+
+Write-Host "Writing secrets to Key Vault..." -ForegroundColor Cyan
+
+# Grant the current user Secrets Officer so we can write secrets right now
+$currentUserId = (Get-AzADUser -UserPrincipalName (Get-AzContext).Account.Id).Id
+New-AzRoleAssignment `
+    -ObjectId            $currentUserId `
+    -RoleDefinitionName  'Key Vault Secrets Officer' `
+    -Scope               $kv.ResourceId | Out-Null
+
+Start-Sleep -Seconds 15   # allow RBAC propagation before writing
+
+foreach ($entry in $secretInputs.GetEnumerator()) {
+    Set-AzKeyVaultSecret -VaultName $keyVaultName -Name $entry.Key -SecretValue $entry.Value | Out-Null
+    Write-Host "  Stored: $($entry.Key)"
 }
 
 #endregion
 
-#region STEP 4 — Upload Runbook
+#region STEP 5 — Grant Managed Identity Read Access to Key Vault
 
-Write-Host "Importing runbook..." -ForegroundColor Cyan
+Write-Host "Granting Managed Identity 'Key Vault Secrets User' role..." -ForegroundColor Cyan
+
+New-AzRoleAssignment `
+    -ObjectId            $principalId `
+    -RoleDefinitionName  'Key Vault Secrets User' `
+    -Scope               $kv.ResourceId | Out-Null
+
+Write-Host "  Granted: Key Vault Secrets User → Managed Identity"
+
+#endregion
+
+#region STEP 6 — Grant GitHub Actions SP Access to Key Vault (optional)
+
+if ($githubSpObjectId) {
+    Write-Host "Granting GitHub Actions SP 'Key Vault Secrets Officer' role..." -ForegroundColor Cyan
+    New-AzRoleAssignment `
+        -ObjectId            $githubSpObjectId `
+        -RoleDefinitionName  'Key Vault Secrets Officer' `
+        -Scope               $kv.ResourceId | Out-Null
+    Write-Host "  Granted: Key Vault Secrets Officer → GitHub Actions SP"
+} else {
+    Write-Host "Skipping GitHub Actions Key Vault role (githubSpObjectId not set)." -ForegroundColor Yellow
+}
+
+#endregion
+
+#region STEP 7 — Automation Variable (Key Vault name only — not sensitive)
+
+Write-Host "Setting Automation Variable (KeyVaultName)..." -ForegroundColor Cyan
+
+New-AzAutomationVariable `
+    -ResourceGroupName     $resourceGroupName `
+    -AutomationAccountName $automationAccountName `
+    -Name                  'KeyVaultName' `
+    -Value                 $keyVaultName `
+    -Encrypted             $false | Out-Null
+
+#endregion
+
+#region STEP 8 — Upload Runbook
+
+Write-Host "Importing and publishing runbook..." -ForegroundColor Cyan
 
 Import-AzAutomationRunbook `
-    -ResourceGroupName $resourceGroupName `
+    -ResourceGroupName     $resourceGroupName `
     -AutomationAccountName $automationAccountName `
-    -Name 'Get-DisabledGroupMembers' `
-    -Path (Resolve-Path $runbookPath) `
-    -Type PowerShell `
+    -Name                  'Get-DisabledGroupMembers' `
+    -Path                  (Resolve-Path $runbookPath) `
+    -Type                  PowerShell `
     -Force | Out-Null
 
 Publish-AzAutomationRunbook `
-    -ResourceGroupName $resourceGroupName `
+    -ResourceGroupName     $resourceGroupName `
     -AutomationAccountName $automationAccountName `
-    -Name 'Get-DisabledGroupMembers'
+    -Name                  'Get-DisabledGroupMembers'
 
 #endregion
 
-#region STEP 5 — Graph API Permissions for the Managed Identity
+#region STEP 9 — Graph API Permissions for the Managed Identity
 
 Write-Host "Assigning Microsoft Graph permissions to Managed Identity..." -ForegroundColor Cyan
-Write-Host "  (requires AzureAD or Microsoft.Graph module)" -ForegroundColor Yellow
-
-# Permissions needed:
-#   GroupMember.Read.All  — read group membership
-#   User.Read.All         — read user accountEnabled property
-#   Mail.Send             — send email as the sender mailbox
-#
-# Run the block below ONCE. It uses the Microsoft.Graph module.
-# Install-Module Microsoft.Graph -Scope CurrentUser
 
 Connect-MgGraph -Scopes 'AppRoleAssignment.ReadWrite.All', 'Application.Read.All' | Out-Null
 
-$graphSp = Get-MgServicePrincipal -Filter "appId eq '00000003-0000-0000-c000-000000000000'"
-
+$graphSp       = Get-MgServicePrincipal -Filter "appId eq '00000003-0000-0000-c000-000000000000'"
 $requiredRoles = @('GroupMember.Read.All', 'User.Read.All', 'Mail.Send')
 
 foreach ($roleName in $requiredRoles) {
@@ -140,26 +196,27 @@ foreach ($roleName in $requiredRoles) {
 
 #endregion
 
-#region STEP 6 — Schedule
+#region STEP 10 — Schedule
 
 Write-Host "Creating weekly schedule (Mondays 07:00 UTC)..." -ForegroundColor Cyan
 
-$schedule = New-AzAutomationSchedule `
-    -ResourceGroupName $resourceGroupName `
+New-AzAutomationSchedule `
+    -ResourceGroupName     $resourceGroupName `
     -AutomationAccountName $automationAccountName `
-    -Name 'Weekly-Monday-0700' `
-    -StartTime $scheduleStartTime `
-    -WeekInterval 1 `
-    -DaysOfWeek Monday `
-    -TimeZone 'UTC'
+    -Name                  'Weekly-Monday-0700' `
+    -StartTime             $scheduleStartTime `
+    -WeekInterval          1 `
+    -DaysOfWeek            Monday `
+    -TimeZone              'UTC' | Out-Null
 
 Register-AzAutomationScheduledRunbook `
-    -ResourceGroupName $resourceGroupName `
+    -ResourceGroupName     $resourceGroupName `
     -AutomationAccountName $automationAccountName `
-    -RunbookName 'Get-DisabledGroupMembers' `
-    -ScheduleName 'Weekly-Monday-0700' | Out-Null
+    -RunbookName           'Get-DisabledGroupMembers' `
+    -ScheduleName          'Weekly-Monday-0700' | Out-Null
 
 #endregion
 
 Write-Host "`nDeployment complete." -ForegroundColor Green
-Write-Host "Test the runbook: Start-AzAutomationRunbook -ResourceGroupName $resourceGroupName -AutomationAccountName $automationAccountName -Name 'Get-DisabledGroupMembers'"
+Write-Host "Key Vault : https://portal.azure.com/#resource$($kv.ResourceId)"
+Write-Host "Test run  : Start-AzAutomationRunbook -ResourceGroupName $resourceGroupName -AutomationAccountName $automationAccountName -Name 'Get-DisabledGroupMembers'"

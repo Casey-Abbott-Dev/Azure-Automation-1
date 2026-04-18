@@ -3,44 +3,70 @@
         Reports disabled Entra ID accounts found in a specified security group.
         Runs under the Automation Account's System-assigned Managed Identity.
 
-    REQUIRED Automation Variables (encrypted where noted):
-        GroupObjectId        - Object ID of the Entra ID security group to audit
-        SenderMailbox        - UPN of the M365 mailbox used to send the report (e.g. alerts@contoso.com)
-        RecipientEmail       - Email address to receive the report
-        TenantId             - Azure AD tenant ID
+    CONFIGURATION
+        One Automation Variable is required (non-sensitive):
+            KeyVaultName  - Name of the Azure Key Vault holding all secrets
+
+        All sensitive values are read from Key Vault at runtime:
+            group-object-id   - Object ID of the Entra ID security group to audit
+            sender-mailbox    - UPN of the M365 mailbox used to send the report
+            recipient-email   - Email address to receive the report
+            tenant-id         - Azure AD tenant ID
 #>
 
 param()
 
-#region --- Auth via Managed Identity ---
+#region --- Helpers ---
 
-$resourceUrl = 'https://graph.microsoft.com'
+function Get-ManagedIdentityToken {
+    param([string]$Resource)
+    $uri = "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=$Resource"
+    $response = Invoke-RestMethod -Uri $uri -Headers @{ Metadata = 'true' } -Method Get
+    return $response.access_token
+}
 
-$tokenResponse = Invoke-RestMethod `
-    -Uri "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=$resourceUrl" `
-    -Headers @{ Metadata = 'true' } `
-    -Method Get
-
-$accessToken = $tokenResponse.access_token
-$headers = @{ Authorization = "Bearer $accessToken"; 'Content-Type' = 'application/json' }
+function Get-KeyVaultSecret {
+    param(
+        [string]$VaultName,
+        [string]$SecretName,
+        [string]$Token
+    )
+    $uri = "https://$VaultName.vault.azure.net/secrets/$SecretName`?api-version=7.4"
+    $response = Invoke-RestMethod -Uri $uri -Headers @{ Authorization = "Bearer $Token" } -Method Get
+    return $response.value
+}
 
 #endregion
 
-#region --- Load Automation Variables ---
+#region --- Auth via Managed Identity ---
 
-$groupObjectId   = Get-AutomationVariable -Name 'GroupObjectId'
-$senderMailbox   = Get-AutomationVariable -Name 'SenderMailbox'
-$recipientEmail  = Get-AutomationVariable -Name 'RecipientEmail'
+Write-Output "Acquiring tokens via Managed Identity..."
+$kvToken    = Get-ManagedIdentityToken -Resource 'https://vault.azure.net'
+$graphToken = Get-ManagedIdentityToken -Resource 'https://graph.microsoft.com'
+
+$graphHeaders = @{ Authorization = "Bearer $graphToken"; 'Content-Type' = 'application/json' }
+
+#endregion
+
+#region --- Load Secrets from Key Vault ---
+
+Write-Output "Reading configuration from Key Vault..."
+$kvName = Get-AutomationVariable -Name 'KeyVaultName'
+
+$groupObjectId  = Get-KeyVaultSecret -VaultName $kvName -SecretName 'group-object-id'  -Token $kvToken
+$senderMailbox  = Get-KeyVaultSecret -VaultName $kvName -SecretName 'sender-mailbox'   -Token $kvToken
+$recipientEmail = Get-KeyVaultSecret -VaultName $kvName -SecretName 'recipient-email'  -Token $kvToken
 
 #endregion
 
 #region --- Get Group Members (paged) ---
 
+Write-Output "Querying group members..."
 $disabledMembers = [System.Collections.Generic.List[PSCustomObject]]::new()
 $nextLink = "https://graph.microsoft.com/v1.0/groups/$groupObjectId/members?`$select=id,displayName,userPrincipalName,accountEnabled&`$top=999"
 
 do {
-    $response = Invoke-RestMethod -Uri $nextLink -Headers $headers -Method Get
+    $response = Invoke-RestMethod -Uri $nextLink -Headers $graphHeaders -Method Get
     foreach ($member in $response.value) {
         if ($member.'@odata.type' -eq '#microsoft.graph.user' -and $member.accountEnabled -eq $false) {
             $disabledMembers.Add([PSCustomObject]@{
@@ -57,8 +83,8 @@ do {
 
 #region --- Build Email ---
 
-$runDate   = (Get-Date).ToString('yyyy-MM-dd HH:mm UTC')
-$count     = $disabledMembers.Count
+$runDate = (Get-Date).ToString('yyyy-MM-dd HH:mm UTC')
+$count   = $disabledMembers.Count
 
 if ($count -eq 0) {
     $bodyHtml = @"
@@ -106,9 +132,10 @@ $mailBody = @{
 
 #region --- Send Email ---
 
+Write-Output "Sending report email..."
 Invoke-RestMethod `
     -Uri "https://graph.microsoft.com/v1.0/users/$senderMailbox/sendMail" `
-    -Headers $headers `
+    -Headers $graphHeaders `
     -Method Post `
     -Body $mailBody
 

@@ -1,0 +1,74 @@
+name: Deploy Runbook to Azure Automation
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'runbook/**.ps1'   # only triggers when runbook files change
+
+  workflow_dispatch:        # allows manual trigger from GitHub Actions UI
+
+permissions:
+  id-token: write   # required for OIDC login
+  contents: read
+
+env:
+  RESOURCE_GROUP:        rg-automation-audit
+  AUTOMATION_ACCOUNT:    aa-disabled-user-audit
+  RUNBOOK_NAME:          Get-DisabledGroupMembers
+  RUNBOOK_PATH:          runbook/Get-DisabledGroupMembers.ps1
+  KEY_VAULT_NAME:        ${{ vars.KEY_VAULT_NAME }}   # set as a repo variable (not a secret)
+
+jobs:
+  deploy:
+    name: Import & Publish Runbook
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to Azure (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Import runbook
+        uses: azure/cli@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az automation runbook replace-content \
+              --resource-group   "${{ env.RESOURCE_GROUP }}" \
+              --automation-account-name "${{ env.AUTOMATION_ACCOUNT }}" \
+              --name             "${{ env.RUNBOOK_NAME }}" \
+              --content          @${{ env.RUNBOOK_PATH }}
+
+      - name: Publish runbook
+        uses: azure/cli@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az automation runbook publish \
+              --resource-group   "${{ env.RESOURCE_GROUP }}" \
+              --automation-account-name "${{ env.AUTOMATION_ACCOUNT }}" \
+              --name             "${{ env.RUNBOOK_NAME }}"
+
+      - name: Confirm deployment
+        uses: azure/cli@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            STATE=$(az automation runbook show \
+              --resource-group   "${{ env.RESOURCE_GROUP }}" \
+              --automation-account-name "${{ env.AUTOMATION_ACCOUNT }}" \
+              --name             "${{ env.RUNBOOK_NAME }}" \
+              --query            "state" -o tsv)
+            echo "Runbook state: $STATE"
+            if [ "$STATE" != "Published" ]; then
+              echo "ERROR: Runbook did not reach Published state."
+              exit 1
+            fi

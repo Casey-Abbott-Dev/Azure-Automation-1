@@ -67,14 +67,13 @@ cd C:\code\AzureAutomation-1
 Open `deploy/Deploy-AzureAutomation.ps1` and fill in the `CONFIGURATION` section at the top:
 
 ```powershell
-$subscriptionId     = 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
-$groupObjectId      = 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'   # Entra ID Group Object ID
-$senderMailbox      = 'alerts@yourdomain.com'                  # M365 licensed mailbox
-$recipientEmail     = 'you@yourdomain.com'                     # where the report is sent
+$subscriptionId = 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
+$keyVaultName   = 'kv-auto-audit-001'   # must be globally unique
 ```
 
-> **Finding your Group Object ID:**
-> Azure Portal → Entra ID → Groups → select your group → copy **Object ID** from the Overview blade.
+Sensitive values (`groupObjectId`, `senderMailbox`, `recipientEmail`) are **not in the file** — the script will prompt for them at runtime with masked input and write them directly to Key Vault as SecureStrings.
+
+> **Key Vault name:** Must be globally unique across Azure (3–24 chars, alphanumeric + hyphens). If the name is taken, add a short suffix like your initials (e.g. `kv-auto-audit-cab`).
 
 ### Step 3 — Connect to Azure and run the deployment
 
@@ -106,9 +105,11 @@ After the script runs, a Global Administrator must **grant admin consent** for t
 |---|---|---|
 | Resource Group | `rg-automation-audit` | Created in the region you specify |
 | Automation Account | `aa-disabled-user-audit` | System-assigned Managed Identity enabled |
+| Key Vault | `kv-auto-audit-001` | RBAC-mode; holds all sensitive config |
+| Key Vault Secrets | 4 secrets | group-object-id, sender-mailbox, recipient-email, tenant-id |
 | Runbook | `Get-DisabledGroupMembers` | PowerShell 5.1, published and ready |
 | Schedule | `Weekly-Monday-0700` | Every Monday at 07:00 UTC |
-| Automation Variables | 4 variables | GroupObjectId, SenderMailbox, RecipientEmail, TenantId |
+| Automation Variable | 1 variable | `KeyVaultName` only (not sensitive) |
 | Graph API Permissions | 3 app roles | GroupMember.Read.All, User.Read.All, Mail.Send |
 
 ---
@@ -218,12 +219,148 @@ Register-AzAutomationScheduledRunbook `
 
 ---
 
+## CI/CD — GitHub to Azure Automation
+
+The workflow at `.github/workflows/deploy-runbook.yml` automatically deploys your runbook to Azure Automation whenever you push changes to `runbook/*.ps1` on `main`. It uses **OIDC (Workload Identity Federation)** — no client secrets stored in GitHub.
+
+```
+Push to main
+     │
+     ▼
+GitHub Actions Workflow
+     │
+     ├─ azure/login (OIDC — no secrets)
+     ├─ az automation runbook replace-content
+     ├─ az automation runbook publish
+     └─ Verify state = Published
+```
+
+### One-Time Setup
+
+#### 1. Create an App Registration in Entra ID
+
+```powershell
+Connect-AzAccount
+
+# Create the app registration
+$app = New-AzADApplication -DisplayName 'github-automation-deployer'
+$sp  = New-AzADServicePrincipal -ApplicationId $app.AppId
+
+# Grant Contributor on the resource group (scoped — not whole subscription)
+New-AzRoleAssignment `
+    -ObjectId            $sp.Id `
+    -RoleDefinitionName  'Contributor' `
+    -ResourceGroupName   'rg-automation-audit'
+
+Write-Host "Client ID : $($app.AppId)"
+Write-Host "Tenant ID : $((Get-AzContext).Tenant.Id)"
+Write-Host "Sub ID    : $((Get-AzContext).Subscription.Id)"
+```
+
+#### 2. Add a Federated Credential (OIDC — no secrets needed)
+
+```powershell
+$params = @{
+    ApplicationObjectId = $app.Id
+    Audience            = @('api://AzureADTokenExchange')
+    Issuer              = 'https://token.actions.githubusercontent.com'
+    Subject             = 'repo:YOUR_GITHUB_USERNAME/AzureAutomation-1:ref:refs/heads/main'
+    Name                = 'github-main-branch'
+}
+New-AzADAppFederatedCredential @params
+```
+
+> Replace `YOUR_GITHUB_USERNAME` with your actual GitHub username or org name.
+
+#### 3. Add GitHub Repository Secrets
+
+In your GitHub repo → **Settings** → **Secrets and variables** → **Actions** → **New repository secret**:
+
+| Secret name | Value |
+|---|---|
+| `AZURE_CLIENT_ID` | App Registration **Application (client) ID** |
+| `AZURE_TENANT_ID` | Your **Tenant ID** |
+| `AZURE_SUBSCRIPTION_ID` | Your **Subscription ID** |
+
+#### 4. Push a change to trigger the workflow
+
+Edit anything in `runbook/Get-DisabledGroupMembers.ps1`, commit, and push to `main`. The workflow runs automatically.
+
+To watch it: **GitHub repo** → **Actions** tab → select the running workflow.
+
+### Triggering the Workflow Manually (without a code change)
+
+**GitHub UI:**
+1. Go to your repo → **Actions** tab
+2. Click **Deploy Runbook to Azure Automation** in the left list
+3. Click **Run workflow** → select branch `main` → click **Run workflow**
+
+**GitHub CLI:**
+```bash
+gh workflow run deploy-runbook.yml --ref main
+gh run watch   # stream live output
+```
+
+---
+
+## Managing Key Vault Secrets
+
+All sensitive configuration lives in Azure Key Vault. The Automation runbook reads secrets at runtime using its Managed Identity — no credentials are stored in the Automation Account or in code.
+
+### Secret names and what they hold
+
+| Secret Name | Purpose |
+|---|---|
+| `group-object-id` | Object ID of the Entra ID security group to audit |
+| `sender-mailbox` | UPN of the M365 mailbox that sends the report |
+| `recipient-email` | Email address that receives the report |
+| `tenant-id` | Azure AD tenant ID |
+
+### Viewing secrets (Portal)
+
+1. **Azure Portal** → **Key Vaults** → `kv-auto-audit-001`
+2. Click **Secrets** in the left menu
+3. Click any secret name to see its versions and current value
+
+### Updating a secret value
+
+**Portal:** Key Vault → Secrets → click the secret → **New Version** → enter new value → **Create**
+
+**PowerShell:**
+```powershell
+Connect-AzAccount
+$newValue = ConvertTo-SecureString 'new@example.com' -AsPlainText -Force
+Set-AzKeyVaultSecret -VaultName 'kv-auto-audit-001' -Name 'recipient-email' -SecretValue $newValue
+```
+
+The runbook always reads the **latest enabled version** of each secret, so changes take effect on the next job run with no redeployment needed.
+
+### Who can read/write secrets
+
+| Identity | Role | Granted by |
+|---|---|---|
+| Automation Account Managed Identity | `Key Vault Secrets User` (read-only) | Deployment script Step 5 |
+| You (deployment user) | `Key Vault Secrets Officer` (read/write) | Deployment script Step 4 |
+| GitHub Actions SP (optional) | `Key Vault Secrets Officer` (read/write) | Deployment script Step 6 |
+
+To grant another user read access:
+```powershell
+New-AzRoleAssignment `
+    -SignInName         'colleague@yourdomain.com' `
+    -RoleDefinitionName 'Key Vault Secrets User' `
+    -Scope              (Get-AzKeyVault -VaultName 'kv-auto-audit-001').ResourceId
+```
+
+---
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Job fails with `401 Unauthorized` | Admin consent not granted | Complete Step 4 above |
-| Job fails with `Resource not found` | Wrong Group Object ID | Check `GroupObjectId` Automation Variable |
+| Job fails with `401 Unauthorized` on Graph | Admin consent not granted | Complete Step 4 above |
+| Job fails with `401 Unauthorized` on Key Vault | Managed Identity missing KV role | Re-run Step 5 of the deployment script |
+| Job fails with `Secret not found` | Secret name typo or missing secret | Check Key Vault → Secrets; names must match exactly |
+| Job fails with `Resource not found` | Wrong Group Object ID | Update `group-object-id` secret in Key Vault |
+| Job fails with `Variable not found` | `KeyVaultName` Automation Variable missing | Re-run the deployment script or add it manually |
 | Email not received | Sender mailbox has no Exchange Online license | Assign an M365 license to the sender UPN |
-| Job fails with `Variable not found` | Automation Variables missing | Re-run the deployment script or add manually in the Portal |
-| No output in job logs | Runbook not published | Publish via Portal or re-run deployment |
+| No output in job logs | Runbook not published | Push a change to trigger GitHub Actions, or publish via Portal |

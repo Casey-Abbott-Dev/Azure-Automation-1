@@ -1,6 +1,6 @@
 # Runbook — Get-DisabledGroupMembers
 
-This PowerShell runbook is the core logic of the audit solution. It runs inside Azure Automation and has no interactive parameters — all configuration is read from **Automation Variables** at runtime.
+This PowerShell runbook is the core logic of the audit solution. It runs inside Azure Automation, authenticates via the Automation Account's **System-assigned Managed Identity**, reads all sensitive configuration from **Azure Key Vault**, then queries Entra ID and sends a report email via Microsoft Graph.
 
 ---
 
@@ -9,46 +9,78 @@ This PowerShell runbook is the core logic of the audit solution. It runs inside 
 ```
 Start
   │
-  ├─ 1. Authenticate via Managed Identity (IMDS token endpoint)
+  ├─ 1. Acquire two tokens via Managed Identity (IMDS)
+  │       ├─ Token A: https://vault.azure.net     (Key Vault)
+  │       └─ Token B: https://graph.microsoft.com (Graph API)
   │
-  ├─ 2. Read four Automation Variables
+  ├─ 2. Read KeyVaultName from the single Automation Variable
   │
-  ├─ 3. Page through all members of the target Entra ID group
-  │       GET /v1.0/groups/{id}/members?$select=id,displayName,userPrincipalName,accountEnabled
+  ├─ 3. Read four secrets from Key Vault
+  │       ├─ group-object-id
+  │       ├─ sender-mailbox
+  │       ├─ recipient-email
+  │       └─ tenant-id
+  │
+  ├─ 4. Page through all members of the target Entra ID group
+  │       GET /v1.0/groups/{id}/members
   │       Handles @odata.nextLink pagination automatically
   │
-  ├─ 4. Filter to members where accountEnabled = false
+  ├─ 5. Filter to members where accountEnabled = false
   │
-  ├─ 5. Build HTML email
+  ├─ 6. Build HTML email
   │       ├─ If disabled count = 0  →  "No issues found" message
-  │       └─ If disabled count > 0  →  HTML table with DisplayName / UPN / ObjectId
+  │       └─ If disabled count > 0  →  HTML table (DisplayName / UPN / ObjectId)
   │
-  └─ 6. Send email via Graph API
+  └─ 7. Send email via Graph API
           POST /v1.0/users/{senderMailbox}/sendMail
 ```
 
 ---
 
-## Required Automation Variables
+## Configuration
 
-These must exist in the Automation Account before the runbook runs. The deployment script creates them automatically. You can also set them manually via:
+### Automation Variable (non-sensitive)
 
-**Portal:** Automation Account → **Variables** → **Add a variable**
+Only one Automation Variable is needed — it tells the runbook where to find the Key Vault. It is not encrypted because a Key Vault name is not a secret.
 
 | Variable Name | Type | Encrypted | Example Value |
 |---|---|---|---|
-| `GroupObjectId` | String | No | `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` |
-| `SenderMailbox` | String | No | `alerts@contoso.com` |
-| `RecipientEmail` | String | No | `admin@contoso.com` |
-| `TenantId` | String | No | `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` |
+| `KeyVaultName` | String | No | `kv-auto-audit-001` |
 
-> **Tip:** If your sender mailbox UPN is sensitive, change `Encrypted` to `$true` in the deployment script. The runbook reads it the same way either way.
+**Portal:** Automation Account → **Variables** → **Add a variable**
+
+### Key Vault Secrets
+
+All sensitive values live in Azure Key Vault. The runbook reads them at runtime using the Managed Identity token. Secret names use lowercase and hyphens (Key Vault naming requirement).
+
+| Secret Name | Example Value | Purpose |
+|---|---|---|
+| `group-object-id` | `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` | Entra ID group to audit |
+| `sender-mailbox` | `alerts@contoso.com` | M365 mailbox that sends the report |
+| `recipient-email` | `admin@contoso.com` | Address that receives the report |
+| `tenant-id` | `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` | Azure AD tenant ID |
+
+**Portal:** Key Vault → **Secrets** → **Generate/Import**
+
+To update a secret value via PowerShell:
+```powershell
+$newValue = ConvertTo-SecureString 'new-value-here' -AsPlainText -Force
+Set-AzKeyVaultSecret -VaultName 'kv-auto-audit-001' -Name 'recipient-email' -SecretValue $newValue
+```
 
 ---
 
-## Required Graph API Permissions (Application)
+## Required Permissions
 
-These are granted to the Automation Account's **Managed Identity** (not a user):
+### Managed Identity — Key Vault
+
+The Automation Account's Managed Identity needs the **Key Vault Secrets User** role on the Key Vault. This is scoped to the Key Vault resource only (not the whole subscription).
+
+| Role | Scope | Purpose |
+|---|---|---|
+| `Key Vault Secrets User` | Key Vault resource | Read secrets at runtime |
+
+### Managed Identity — Microsoft Graph (Application permissions)
 
 | Permission | Purpose |
 |---|---|
@@ -56,7 +88,7 @@ These are granted to the Automation Account's **Managed Identity** (not a user):
 | `User.Read.All` | Read the `accountEnabled` property on each user |
 | `Mail.Send` | Send email as the sender mailbox |
 
-> All three are **application permissions** (no signed-in user required). They require **admin consent** — see the root README Step 4.
+All three require **admin consent** — see root README Step 4.
 
 ---
 
@@ -66,27 +98,21 @@ These are granted to the Automation Account's **Managed Identity** (not a user):
 
 > Subject: `[Azure Automation] Disabled Account Audit - 3 Disabled User(s) Found (2026-04-17 07:00 UTC)`
 
-An HTML table is included with columns: Display Name, UPN, Object ID.
+An HTML table is included: Display Name, UPN, Object ID.
 
 **When no disabled accounts are found:**
 
 > Subject: `[Azure Automation] Disabled Account Audit - No Issues Found (2026-04-17 07:00 UTC)`
 
-A short confirmation message is sent so you always know the job ran successfully.
+A confirmation is always sent so you know the job ran successfully.
 
 ---
 
 ## Modifying the Runbook
 
-To edit the runbook after deployment:
-
-**Portal:**
-1. Automation Account → **Runbooks** → `Get-DisabledGroupMembers`
-2. Click **Edit**
-3. Make your changes → click **Save** → click **Publish**
-
-**PowerShell (re-import after editing locally):**
+To edit and redeploy locally:
 ```powershell
+# After editing Get-DisabledGroupMembers.ps1 locally:
 Import-AzAutomationRunbook `
     -ResourceGroupName     'rg-automation-audit' `
     -AutomationAccountName 'aa-disabled-user-audit' `
@@ -101,6 +127,8 @@ Publish-AzAutomationRunbook `
     -Name                  'Get-DisabledGroupMembers'
 ```
 
+Or push to the `main` branch — GitHub Actions handles import and publish automatically.
+
 > Changes only take effect after **Publish**. A saved-but-not-published runbook still runs the previous published version.
 
 ---
@@ -111,7 +139,6 @@ Publish-AzAutomationRunbook `
 
 **PowerShell:**
 ```powershell
-# Get the most recent job ID
 $job = Get-AzAutomationJob `
     -ResourceGroupName 'rg-automation-audit' `
     -AutomationAccountName 'aa-disabled-user-audit' `
@@ -119,13 +146,13 @@ $job = Get-AzAutomationJob `
     Sort-Object StartTime -Descending |
     Select-Object -First 1
 
-# Show output
+# Output stream
 Get-AzAutomationJobOutput `
     -ResourceGroupName 'rg-automation-audit' `
     -AutomationAccountName 'aa-disabled-user-audit' `
     -Id $job.JobId -Stream Output
 
-# Show errors (if job failed)
+# Error stream (if job failed)
 Get-AzAutomationJobOutput `
     -ResourceGroupName 'rg-automation-audit' `
     -AutomationAccountName 'aa-disabled-user-audit' `
