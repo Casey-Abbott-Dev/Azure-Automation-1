@@ -6,7 +6,7 @@
         - Az PowerShell module        (Install-Module Az -Scope CurrentUser)
         - Microsoft.Graph module      (Install-Module Microsoft.Graph -Scope CurrentUser)
         - Connected to Azure          (Connect-AzAccount)
-        - A Microsoft 365 mailbox for the sender UPN
+        - A Microsoft 365 mailbox for the sender UPN (A service account will be needed.)
 
     USAGE
         Edit the CONFIGURATION block below (non-sensitive values only), then run
@@ -16,13 +16,13 @@
 
 #region --- CONFIGURATION — non-sensitive infrastructure values only ---
 
-$subscriptionId        = 'YOUR_SUBSCRIPTION_ID'
-$resourceGroupName     = 'rg-automation-audit'
+$subscriptionId        = '7ad77a76-61d6-41d3-87a2-bdccdcd2fe76'
+$resourceGroupName     = 'rg-d-automate-001'
 $location              = 'eastus'
 $automationAccountName = 'aa-disabled-user-audit'
 
 # Key Vault name — must be globally unique, 3-24 chars, alphanumeric and hyphens only
-$keyVaultName          = 'kv-auto-audit-001'
+$keyVaultName          = 'kv-d-automate-001'
 
 # Object ID of the GitHub Actions service principal (from the CI/CD setup)
 # Set to $null to skip granting GitHub Actions access to Key Vault
